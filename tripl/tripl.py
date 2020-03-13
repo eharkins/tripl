@@ -25,7 +25,7 @@ import sys
 
 # Constants
 # ---------
-SUPPORTED_TYPES = (str, bytes, int, float, bool, dict, Entity, uuid.UUID)
+SUPPORTED_TYPES = (str, bytes, int, float, bool, dict, uuid.UUID)
 try:
     # In Python 2 `str = bytes` and an additional `unicode` type is used for strings:
     SUPPORTED_TYPES += (unicode,)
@@ -41,9 +41,9 @@ def log(name, value):
     print("\n")
 
 
-def some(xs, default=None):
+def _some(xs, default=None, supported_types=SUPPORTED_TYPES):
     """return some thing from the set, or None if nothing"""
-    if isinstance(xs, SUPPORTED_TYPES):
+    if isinstance(xs, supported_types):
         return xs
     else:
         try:
@@ -73,6 +73,132 @@ def profiled(f):
 # Now for the code:
 # =================
 
+
+
+# Would be great to implement something analagous to the entity API, but would need to have schema I think
+# to traverse the references
+class Entity(object):
+    def __init__(self, graph, ident, namespace=None):
+        self._graph = graph
+        # TODO Should allow for entity in leiu of ident
+        self.ident = ident
+        self._entity = graph._eav_index.get([ident])
+        # Question: Should we call this type or namespace?
+        self.namespace = namespace
+        self.namespace = namespace or graph._eav_index.get_some([ident, 'tripl:type'])
+
+    def __repr__(self):
+        r = self.namespace + ':' if self.namespace else ''
+        return r + str({k: self._entity.get([k]) for k in self.keys()})
+
+    def __getitem__(self, key):
+        # This is really the only magic to this object, over just looking at the EAV index
+        # Should probably have these globally cached or something, so we don't create dups?
+        # lazy_ref means that we allow you to infer relationships without assigning a reference type
+        if self.namespace and len(key.split(':')) == 1:
+            return self.__getitem__(self.namespace + ':' + key)
+        # reverse lookup ref
+        if str(key).split(':')[-1][0:1] == '_':
+            namespace, name = key.split(':')
+            name = name[1:]
+            key = namespace + ':' + name
+            if self._graph._ref_attr(key):
+                return list(type(self)(self._graph, v) for v in self._graph._vae_index.get([self.eid, key]))
+            elif self._graph.lazy_refs:
+                return list(type(self)(self._graph, e)
+                            for e, vs in self._graph._aev_index.get([key]).keys.items()
+                            if self.ident in vs)
+            else:
+                return []
+        # reference
+        if self._graph._ref_attr(key) or \
+                (self._graph.lazy_refs
+                 and self._entity.get([key])
+                 and all(self._graph._eav_index.contains([v]) for v in self._entity.get([key]))):
+            results = [type(self)(self._graph, ident) for ident in self._entity.get([key])]
+        else:
+            results = self._entity.get([key])
+        if self._graph._card_one(key):
+            return _some(results)
+        else:
+            return results
+
+    def get(self, key, default=None):
+        """Get a list of values corresponding to the given key (attribute).
+        
+        Note: Eventually we may treat schema in such a way where get returns the singular value for things
+        marked cardinality one."""
+        return self[key] or default
+
+    def get_in(self, keys, default=None):
+        """Recursive form of get, where keys is a list or tuple. Returns default if any key in the relation
+        trace ends up missing."""
+        if len(keys) == 0:
+            # does this make sense? return default instead?
+            return self
+        elif len(keys) == 1:
+            return self.get(keys[0])
+        else:
+            # have to make sure that for cardinality one we don't accidentally iterate over k/v pairs of a
+            # dict as though they are each entity dicts
+            key_result = self.get(keys[0])
+
+            def sub_results(x):
+                return x.get_in(keys[1:]) or []
+
+            if isinstance(key_result, list):
+                result = list(subval
+                              for x in key_result
+                              for subval in sub_results(x))
+            elif key_result:
+                result = sub_results(key_result)
+            else:
+                result = []
+            return result or default
+
+    def some(self, key, default=None):
+        """Like get, but returns a single value, instead of a list of values. Best used if you are expecting
+        just a single value. But be cautioned that there is no verification of this.
+        
+        Note: we may eventually add an option that raises an error if missing."""
+        return _some(self[key], default=default, supported_types=SUPPORTED_TYPES+(Entity,))
+
+    def some_in(self, keys, default=None):
+        """Like get_in, but returns a single value, instead of a list of values. Best used if you are expecting
+        just a single value. But be cautioned that there is no verification of this.
+        
+        Note: we may eventually add an option that raises an error if missing."""
+        return _some(self.get_in(keys), default=default, supported_types=SUPPORTED_TYPES+(Entity,))
+
+    def __getattr__(self, key):
+        if self.namespace and len(key.split(':')) == 1:
+            return self[self.namespace + ':' + key]
+        else:
+            return self[key]
+
+    def __contains__(self, key):
+        if key in self._entity.keys:
+            return True
+        else:
+            if str(key).split(':')[-1][0:1] == '_':
+                key = key.replace('_', '')
+                return self._graph._ref_attr(key)
+
+    def __len__(self):
+        return len(self._entity.keys)
+
+    def keys(self):
+        if self._entity:
+            keys = self._entity.keys.keys()
+            if 'db:ident' not in keys:
+                return ['db:ident'] + keys
+            return keys
+        else:
+            return []
+
+SUPPORTED_TYPES+=(Entity,)
+def some(xs, default=None, supported_types=SUPPORTED_TYPES):
+    return _some(xs, default=default, supported_types=supported_types)
 
 class TupleIndex(object):
     def __init__(self, depth=2, vals_container=set):
@@ -143,129 +269,6 @@ class TupleIndex(object):
 
 def _triple_index(vals_container=set):
     return TupleIndex()
-
-
-# Would be great to implement something analagous to the entity API, but would need to have schema I think
-# to traverse the references
-class Entity(object):
-    def __init__(self, graph, ident, namespace=None):
-        self._graph = graph
-        # TODO Should allow for entity in leiu of ident
-        self.ident = ident
-        self._entity = graph._eav_index.get([ident])
-        # Question: Should we call this type or namespace?
-        self.namespace = namespace
-        self.namespace = namespace or graph._eav_index.get_some([ident, 'tripl:type'])
-
-    def __repr__(self):
-        r = self.namespace + ':' if self.namespace else ''
-        return r + str({k: self._entity.get([k]) for k in self.keys()})
-
-    def __getitem__(self, key):
-        # This is really the only magic to this object, over just looking at the EAV index
-        # Should probably have these globally cached or something, so we don't create dups?
-        # lazy_ref means that we allow you to infer relationships without assigning a reference type
-        if self.namespace and len(key.split(':')) == 1:
-            return self.__getitem__(self.namespace + ':' + key)
-        # reverse lookup ref
-        if str(key).split(':')[-1][0:1] == '_':
-            namespace, name = key.split(':')
-            name = name[1:]
-            key = namespace + ':' + name
-            if self._graph._ref_attr(key):
-                return list(type(self)(self._graph, v) for v in self._graph._vae_index.get([self.eid, key]))
-            elif self._graph.lazy_refs:
-                return list(type(self)(self._graph, e)
-                            for e, vs in self._graph._aev_index.get([key]).keys.items()
-                            if self.ident in vs)
-            else:
-                return []
-        # reference
-        if self._graph._ref_attr(key) or \
-                (self._graph.lazy_refs
-                 and self._entity.get([key])
-                 and all(self._graph._eav_index.contains([v]) for v in self._entity.get([key]))):
-            results = [type(self)(self._graph, ident) for ident in self._entity.get([key])]
-        else:
-            results = self._entity.get([key])
-        if self._graph._card_one(key):
-            return some(results)
-        else:
-            return results
-
-    def get(self, key, default=None):
-        """Get a list of values corresponding to the given key (attribute).
-        
-        Note: Eventually we may treat schema in such a way where get returns the singular value for things
-        marked cardinality one."""
-        return self[key] or default
-
-    def get_in(self, keys, default=None):
-        """Recursive form of get, where keys is a list or tuple. Returns default if any key in the relation
-        trace ends up missing."""
-        if len(keys) == 0:
-            # does this make sense? return default instead?
-            return self
-        elif len(keys) == 1:
-            return self.get(keys[0])
-        else:
-            # have to make sure that for cardinality one we don't accidentally iterate over k/v pairs of a
-            # dict as though they are each entity dicts
-            key_result = self.get(keys[0])
-
-            def sub_results(x):
-                return x.get_in(keys[1:]) or []
-
-            if isinstance(key_result, list):
-                result = list(subval
-                              for x in key_result
-                              for subval in sub_results(x))
-            elif key_result:
-                result = sub_results(key_result)
-            else:
-                result = []
-            return result or default
-
-    def some(self, key, default=None):
-        """Like get, but returns a single value, instead of a list of values. Best used if you are expecting
-        just a single value. But be cautioned that there is no verification of this.
-        
-        Note: we may eventually add an option that raises an error if missing."""
-        return some(self[key], default=default)
-
-    def some_in(self, keys, default=None):
-        """Like get_in, but returns a single value, instead of a list of values. Best used if you are expecting
-        just a single value. But be cautioned that there is no verification of this.
-        
-        Note: we may eventually add an option that raises an error if missing."""
-        return some(self.get_in(keys), default=default)
-
-    def __getattr__(self, key):
-        if self.namespace and len(key.split(':')) == 1:
-            return self[self.namespace + ':' + key]
-        else:
-            return self[key]
-
-    def __contains__(self, key):
-        if key in self._entity.keys:
-            return True
-        else:
-            if str(key).split(':')[-1][0:1] == '_':
-                key = key.replace('_', '')
-                return self._graph._ref_attr(key)
-
-    def __len__(self):
-        return len(self._entity.keys)
-
-    def keys(self):
-        if self._entity:
-            keys = self._entity.keys.keys()
-            if 'db:ident' not in keys:
-                return ['db:ident'] + keys
-            return keys
-        else:
-            return []
-
 
 # def generate_entity_class(name, namespace):
 #     return type(name, (Entity), {
